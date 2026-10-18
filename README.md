@@ -81,7 +81,17 @@ O código usa a coluna `text`, acrescenta EOS entre documentos e treina causalme
 
 O checkpoint mais recente é atualizado a cada **100 passos por padrão**, ao receber Ctrl+C e ao final, no caminho `--out`. Um segundo arquivo `<nome>.best.pt` guarda o checkpoint com menor loss de validação. Por padrão, 128 documentos iniciais do stream são reservados para validação; até 16 lotes são avaliados no primeiro passo e a cada 500 passos. Configure isso com `--validation-documents`, `--validation-batches` e `--validation-every`. Ambos os checkpoints guardam pesos, passo e estados de Muon/AdamW; as gravações são atômicas.
 
-Ao iniciar o treino, `train.py` abre o `code.html` no Firefox por meio de um servidor local. A página atualiza loss de treino a cada passo, loss de validação, melhor loss, contagem de melhorias, progresso e gráfico. Todo passo é acrescentado e descarregado no arquivo `<nome>.losses.jsonl`; ao retomar, use o mesmo `--out` ou informe o caminho antigo com `--loss-log` para continuar o mesmo histórico. Se o histórico estiver além do checkpoint retomado, ele é alinhado ao passo salvo para evitar pontos duplicados ou fora de ordem. O painel converte os dados históricos embutidos no `code.html` para JSONL ao retomar checkpoints antigos sem arquivo de histórico. O número de passos por época é calculado pela configuração atual (`--tokens-per-epoch`, `--batch-size` e `--block-size`) e exibido junto ao progresso da execução retomada.
+Ao iniciar o treino, `train.py` abre o `code.html` no Firefox por meio de um servidor local. A página mostra três gráficos separados: loss de treino, loss de validação e PPL (treino e validação). Os gráficos redesenham a cada 100 passos; os números e o status são atualizados ao vivo. Cada passo, dataset/subdataset e PPL são acrescentados e descarregados no arquivo `<nome>.losses.jsonl`. Ao retomar, use o mesmo `--out` ou informe o caminho antigo com `--loss-log`; se o histórico estiver além do checkpoint, ele é alinhado ao passo salvo para evitar pontos fora de ordem.
+
+O painel também permite pausar, continuar ou parar salvando o checkpoint. O formulário de nova execução configura tokenizer, checkpoint, batch size, block size, orçamento por época, dispositivo, learning rates, validação, salvamento e uma agenda ordenada de datasets/subdatasets. Cada linha da agenda define se aquele dataset roda por épocas ou passos e a quantidade; o botão de iniciar salva e para a execução atual antes de abrir a nova. Para retomar, informe o caminho do checkpoint no campo de retomada. A configuração também pode ser feita inteiramente pela CLI.
+
+Exemplo de agenda via terminal — duas épocas de stories e depois 5.000 passos de matemática:
+
+```bash
+python train.py --out vslm-multidata.pt --dataset-plan '[{"dataset":"HuggingFaceTB/cosmopedia","subset":"stories","mode":"epochs","count":2},{"dataset":"HuggingFaceTB/cosmopedia","subset":"auto_math_text","mode":"steps","count":5000}]' --batch-size 1 --block-size 128 --tokens-per-epoch 1000000
+```
+
+O número de passos por época vem de `--tokens-per-epoch / (--batch-size × --block-size)`. Sem `--dataset-plan`, os argumentos individuais `--dataset`, `--subset` e `--steps`/`--epochs` continuam funcionando.
 
 Use `--best-out` para escolher outro caminho para o arquivo de menor loss.
 
