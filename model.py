@@ -11,20 +11,15 @@ from torch import nn
 from torch.nn import functional as F
 
 
-WIDTH = 192
-DEPTH = 6
-EMBEDDING_DIM = 256
-EMBEDDING_RANK = 48
-ATTENCIONER_WIDTH = 231
-ATTENCIONER_DEPTH = 4
-DEVECTORIZER_WIDTH = 231
-DEVECTORIZER_DEPTH = 4
-NUM_EXPERTS = 48
-MHC_STREAMS = 4
-CTM_TICKS = 8
-CTM_SYNC_PAIRS = 256
-CTM_USE_SYNCHRONY = True
-TRM_REFINEMENT_STEPS = 8
+WIDTH = 256
+DEPTH = 12
+EMBEDDING_DIM = 384
+EMBEDDING_RANK = 36
+ATTENCIONER_WIDTH = 256
+ATTENCIONER_DEPTH = 6
+DEVECTORIZER_WIDTH = 256
+DEVECTORIZER_DEPTH = 6
+MHC_STREAMS = 3
 MAIN_KERNEL_SIZE = 128
 DEFAULT_TOKENIZER = "gpt2"  # public tokenizer, vocabulary size 50,257
 DEFAULT_DATASET = "HuggingFaceTB/cosmopedia"
@@ -83,127 +78,20 @@ class MHCAttnResidual(nn.Module):
         return (weights.unsqueeze(-1) * values).sum(dim=-2)
 
 
-class SoftRouter(nn.Module):
-    """Dense soft MoE; every expert contributes according to softmax weights."""
-
-    def __init__(self, width: int, experts: int = NUM_EXPERTS):
-        super().__init__()
-        bottleneck = max(16, width // 4)
-        self.gate = nn.Linear(width, experts)
-        # Packed expert weights let batched einsums evaluate all experts together.
-        self.expert_w1 = nn.Parameter(torch.empty(experts, bottleneck, width))
-        self.expert_b1 = nn.Parameter(torch.zeros(experts, bottleneck))
-        self.expert_w2 = nn.Parameter(torch.empty(experts, width, bottleneck))
-        self.expert_b2 = nn.Parameter(torch.zeros(experts, width))
-        for expert in range(experts):
-            nn.init.xavier_uniform_(self.expert_w1[expert])
-            nn.init.xavier_uniform_(self.expert_w2[expert])
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        weights = self.gate(x).softmax(dim=-1)
-        hidden = F.gelu(torch.einsum("...d,ehd->...eh", x, self.expert_w1) + self.expert_b1)
-        outputs = torch.einsum("...eh,edh->...ed", hidden, self.expert_w2) + self.expert_b2
-        return (weights.unsqueeze(-1) * outputs).sum(dim=-2), weights
-
-
-class ContinuousThoughtMachine(nn.Module):
-    """CTM-inspired neuron histories and synchronization for one hidden state."""
-
-    def __init__(self, width: int, ticks: int = CTM_TICKS,
-                 use_synchrony: bool = CTM_USE_SYNCHRONY):
-        super().__init__()
-        self.ticks = ticks
-        self.use_synchrony = use_synchrony
-        pair_count = CTM_SYNC_PAIRS
-        self.synapse = nn.Linear(2 * width + pair_count, width)
-        # A distinct temporal filter for every neuron.
-        self.neuron_history_logits = nn.Parameter(torch.zeros(width, ticks))
-        self.sync_projection = nn.Linear(pair_count, width, bias=False)
-        self.norm = nn.LayerNorm(width)
-
-        # Fixed random pairs sample global neuron relationships, rather than
-        # assuming that adjacent indices have a meaningful relationship.
-        generator = torch.Generator().manual_seed(1729)
-        left = torch.randint(width, (pair_count,), generator=generator)
-        offsets = torch.randint(width - 1, (pair_count,), generator=generator) + 1
-        right = (left + offsets) % width
-        self.register_buffer("sync_left_indices", left, persistent=True)
-        self.register_buffer("sync_right_indices", right, persistent=True)
-
-    def forward(self, context: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-        history = [initial]
-        activity = initial
-        synchrony = torch.zeros_like(initial)
-        for tick in range(self.ticks):
-            observed = torch.stack(history[-self.ticks:], dim=-2)  # [..., observed_time, neuron]
-            missing = self.ticks - observed.shape[-2]
-            if missing:
-                padding_shape = (*observed.shape[:-2], missing, observed.shape[-1])
-                padding = observed.new_zeros(padding_shape)
-                past = torch.cat((padding, observed), dim=-2)
-            else:
-                past = observed
-            # Normalize over the same fixed time axis on every tick. Missing
-            # past activity is zero, so the learned temporal distribution stays stable.
-            temporal_weights = self.neuron_history_logits.softmax(dim=-1)
-            temporal = torch.einsum("...td,dt->...d", past, temporal_weights)
-
-            if self.use_synchrony:
-                centered = past - past.mean(dim=-2, keepdim=True)
-                left = centered.index_select(-1, self.sync_left_indices)
-                right = centered.index_select(-1, self.sync_right_indices)
-                synchrony = (left * right).mean(dim=-2)
-            else:
-                synchrony_shape = (*initial.shape[:-1], CTM_SYNC_PAIRS)
-                synchrony = initial.new_zeros(synchrony_shape)
-            preactivation = self.synapse(torch.cat((context, activity, synchrony), dim=-1))
-            activity = torch.tanh(preactivation + temporal)
-            history.append(activity)
-        sync_update = self.sync_projection(synchrony) if self.use_synchrony else 0.0
-        return self.norm(activity + sync_update)
-
-
-class TinyRecursiveRefiner(nn.Module):
-    """TRM-inspired shared-weight recursion over latent reasoning and answer states."""
-
-    def __init__(self, width: int, steps: int = TRM_REFINEMENT_STEPS):
-        super().__init__()
-        self.steps = steps
-        hidden = max(16, width // 2)
-
-        def update_net() -> nn.Module:
-            return nn.Sequential(
-                nn.LayerNorm(3 * width), nn.Linear(3 * width, hidden), nn.GELU(),
-                nn.Linear(hidden, width),
-            )
-
-        self.latent_update = update_net()
-        self.answer_update = update_net()
-        self.latent_residual = MHCAttnResidual(width)
-        self.answer_residual = MHCAttnResidual(width)
-
-    def forward(self, context: torch.Tensor, initial_answer: torch.Tensor) -> torch.Tensor:
-        latent = initial_answer
-        answer = initial_answer
-        for _ in range(self.steps):
-            latent_delta = self.latent_update(torch.cat((context, answer, latent), dim=-1))
-            latent = self.latent_residual(latent, latent_delta)
-            answer_delta = self.answer_update(torch.cat((context, latent, answer), dim=-1))
-            answer = self.answer_residual(answer, answer_delta)
-        return answer
-
-
 class Attencioner(nn.Module):
     """Shared factorized token embedding plus projection to WIDTH-dimensional vectors."""
 
-    def __init__(self, embedding: FactorizedTokenEmbedding):
+    def __init__(self, embedding: FactorizedTokenEmbedding, width: int = WIDTH,
+                 hidden_width: int = ATTENCIONER_WIDTH, depth: int = ATTENCIONER_DEPTH,
+                 embedding_dim: int = EMBEDDING_DIM,
+                 mhc_streams: int = MHC_STREAMS):
         super().__init__()
         self.embedding = embedding
         self.projection = make_projection_mlp(
-            EMBEDDING_DIM, ATTENCIONER_WIDTH, ATTENCIONER_DEPTH, WIDTH,
+            embedding_dim, hidden_width, depth, width,
         )
-        self.norm = nn.LayerNorm(WIDTH)
-        self.residual = MHCAttnResidual(WIDTH)
+        self.norm = nn.LayerNorm(width)
+        self.residual = MHCAttnResidual(width, mhc_streams)
 
     @staticmethod
     def quantize(vector: torch.Tensor) -> torch.Tensor:
@@ -242,26 +130,24 @@ class CausalDepthwiseConv(nn.Module):
 
 
 class MainModel(nn.Module):
-    """Parallel causal-convolution layers with routing and latent reasoning."""
+    """Causal-convolution layers with attention over the layer outputs."""
 
-    def __init__(self, ctm_synchrony: bool = CTM_USE_SYNCHRONY):
+    def __init__(self, *, width: int = WIDTH, depth: int = DEPTH,
+                 kernel_size: int = MAIN_KERNEL_SIZE, mhc_streams: int = MHC_STREAMS):
         super().__init__()
-        self.causal_convs = nn.ModuleList(CausalDepthwiseConv(WIDTH) for _ in range(DEPTH))
-        self.layer_projections = nn.ModuleList(nn.Linear(3 * WIDTH, WIDTH) for _ in range(DEPTH))
-        self.norms = nn.ModuleList(nn.LayerNorm(WIDTH) for _ in range(DEPTH))
-        self.router = SoftRouter(WIDTH)
-        self.residuals = nn.ModuleList(MHCAttnResidual(WIDTH) for _ in range(DEPTH))
-        self.depth_query = nn.Parameter(torch.empty(WIDTH))
-        nn.init.normal_(self.depth_query, std=WIDTH ** -0.5)
-        self.ctm = ContinuousThoughtMachine(WIDTH, use_synchrony=ctm_synchrony)
-        self.trm = TinyRecursiveRefiner(WIDTH)
+        self.width = width
+        self.depth = depth
+        self.causal_convs = nn.ModuleList(CausalDepthwiseConv(width, kernel_size) for _ in range(depth))
+        self.layer_projections = nn.ModuleList(nn.Linear(2 * width, width) for _ in range(depth))
+        self.norms = nn.ModuleList(nn.LayerNorm(width) for _ in range(depth))
+        self.residuals = nn.ModuleList(MHCAttnResidual(width, mhc_streams) for _ in range(depth))
+        self.depth_query = nn.Parameter(torch.empty(width))
+        nn.init.normal_(self.depth_query, std=width ** -0.5)
 
-    def _finish(self, context: torch.Tensor, layer_outputs: list[torch.Tensor]) -> torch.Tensor:
+    def _finish(self, layer_outputs: list[torch.Tensor]) -> torch.Tensor:
         layer_stack = torch.stack(layer_outputs, dim=-2)
-        scores = torch.einsum("w,...dw->...d", self.depth_query, layer_stack) / math.sqrt(WIDTH)
-        attended = (scores.softmax(dim=-1).unsqueeze(-1) * layer_stack).sum(dim=-2)
-        thought = self.ctm(context, attended)
-        return self.trm(context, thought)
+        scores = torch.einsum("w,...dw->...d", self.depth_query, layer_stack) / math.sqrt(self.width)
+        return (scores.softmax(dim=-1).unsqueeze(-1) * layer_stack).sum(dim=-2)
 
     def forward(self, vectors: torch.Tensor) -> torch.Tensor:
         """Training path: all positions in the block are processed in parallel."""
@@ -271,17 +157,16 @@ class MainModel(nn.Module):
             self.causal_convs, self.layer_projections, self.norms, self.residuals,
         ):
             context = causal_conv(layer_input)
-            expert_update, _ = self.router(layer_input)
-            candidate = norm(projection(torch.cat((layer_input, context, expert_update), dim=-1)))
+            candidate = norm(projection(torch.cat((layer_input, context), dim=-1)))
             layer_input = residual(layer_input, candidate)
             layer_outputs.append(layer_input)
-        return self._finish(vectors, layer_outputs)
+        return self._finish(layer_outputs)
 
     def step(self, vector: torch.Tensor,
              caches: list[torch.Tensor | None] | None = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Incremental causal path used only during autoregressive generation."""
         if caches is None:
-            caches = [None] * DEPTH
+            caches = [None] * self.depth
         next_caches = []
         layer_input = vector
         layer_outputs = []
@@ -289,12 +174,11 @@ class MainModel(nn.Module):
             self.causal_convs, self.layer_projections, self.norms, self.residuals, caches,
         ):
             context, next_cache = causal_conv.step(layer_input, cache)
-            expert_update, _ = self.router(layer_input)
-            candidate = norm(projection(torch.cat((layer_input, context, expert_update), dim=-1)))
+            candidate = norm(projection(torch.cat((layer_input, context), dim=-1)))
             layer_input = residual(layer_input, candidate)
             next_caches.append(next_cache)
             layer_outputs.append(layer_input)
-        return self._finish(vector, layer_outputs), next_caches
+        return self._finish(layer_outputs), next_caches
 
     def scan(self, vectors: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Scan is reserved for prompt setup in generation; training uses forward."""
@@ -309,12 +193,15 @@ class MainModel(nn.Module):
 class FactorizedTokenEmbedding(nn.Module):
     """Tied V×rank and rank×dimension factors for input and output embeddings."""
 
-    def __init__(self, vocab_size: int):
+    def __init__(self, vocab_size: int, rank: int = EMBEDDING_RANK,
+                 embedding_dim: int = EMBEDDING_DIM):
         super().__init__()
-        self.token_factors = nn.Parameter(torch.empty(vocab_size, EMBEDDING_RANK))
-        self.projection = nn.Parameter(torch.empty(EMBEDDING_RANK, EMBEDDING_DIM))
+        self.rank = rank
+        self.embedding_dim = embedding_dim
+        self.token_factors = nn.Parameter(torch.empty(vocab_size, rank))
+        self.projection = nn.Parameter(torch.empty(rank, embedding_dim))
         nn.init.normal_(self.token_factors, mean=0.0, std=0.02)
-        nn.init.normal_(self.projection, mean=0.0, std=EMBEDDING_RANK ** -0.5)
+        nn.init.normal_(self.projection, mean=0.0, std=rank ** -0.5)
 
     @property
     def num_embeddings(self) -> int:
@@ -322,9 +209,13 @@ class FactorizedTokenEmbedding(nn.Module):
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         factors = F.embedding(token_ids, self.token_factors)
+        # [.., EMBEDDING_RANK] × [EMBEDDING_DIM, EMBEDDING_RANK]^T
         return F.linear(factors, self.projection.t())
 
     def output_logits(self, vectors: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        # Input vectors are 256-D; project them back to rank 48 before scoring tokens.
+        # self.projection is [EMBEDDING_RANK, EMBEDDING_DIM], the weight shape
+        # expected by F.linear for a 256-D input.
         factors = F.linear(vectors, self.projection)
         return F.linear(factors, self.token_factors, bias)
 
@@ -332,14 +223,17 @@ class FactorizedTokenEmbedding(nn.Module):
 class DeVectorizer(nn.Module):
     """Project to the shared 256-dimensional space and score every tokenizer token."""
 
-    def __init__(self, embedding: FactorizedTokenEmbedding):
+    def __init__(self, embedding: FactorizedTokenEmbedding, width: int = WIDTH,
+                 hidden_width: int = DEVECTORIZER_WIDTH,
+                 depth: int = DEVECTORIZER_DEPTH, embedding_dim: int = EMBEDDING_DIM,
+                 mhc_streams: int = MHC_STREAMS):
         super().__init__()
         self.embedding = embedding
         self.projection = make_projection_mlp(
-            WIDTH, DEVECTORIZER_WIDTH, DEVECTORIZER_DEPTH, EMBEDDING_DIM,
+            width, hidden_width, depth, embedding_dim,
         )
-        self.residual = MHCAttnResidual(WIDTH)
-        self.residual_projection = nn.Linear(WIDTH, WIDTH)
+        self.residual = MHCAttnResidual(width, mhc_streams)
+        self.residual_projection = nn.Linear(width, width)
         self.bias = nn.Parameter(torch.zeros(embedding.num_embeddings))
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
@@ -350,8 +244,20 @@ class DeVectorizer(nn.Module):
 
 class VSLM(nn.Module):
     def __init__(self, compact_to_original: list[int] | torch.Tensor,
-                 original_vocab_size: int, ctm_synchrony: bool = CTM_USE_SYNCHRONY):
+                 original_vocab_size: int,
+                 architecture: dict[str, int] | None = None):
         super().__init__()
+        arch = {
+            "width": WIDTH, "depth": DEPTH, "attencioner_width": ATTENCIONER_WIDTH,
+            "attencioner_depth": ATTENCIONER_DEPTH,
+            "devectorizer_width": DEVECTORIZER_WIDTH,
+            "devectorizer_depth": DEVECTORIZER_DEPTH,
+            "embedding_dim": EMBEDDING_DIM, "embedding_rank": EMBEDDING_RANK,
+            "main_kernel_size": MAIN_KERNEL_SIZE, "mhc_streams": MHC_STREAMS,
+        }
+        if architecture:
+            arch.update({k: int(v) for k, v in architecture.items() if k in arch})
+        self.architecture = arch
         compact_to_original = torch.as_tensor(compact_to_original, dtype=torch.long)
         if len(compact_to_original) != original_vocab_size:
             raise ValueError("O mapa precisa incluir todos os tokens do tokenizer, sem descartar IDs.")
@@ -361,15 +267,23 @@ class VSLM(nn.Module):
             raise ValueError("O vocabulário original não cobre os IDs compactos informados.")
         self.vocab_size = len(compact_to_original)
         self.original_vocab_size = original_vocab_size
-        self.ctm_synchrony = ctm_synchrony
         token_to_compact = torch.zeros(original_vocab_size, dtype=torch.long)
         token_to_compact[compact_to_original] = torch.arange(self.vocab_size)
         self.register_buffer("compact_to_original", compact_to_original, persistent=True)
         self.register_buffer("token_to_compact", token_to_compact, persistent=True)
-        shared_embedding = FactorizedTokenEmbedding(self.vocab_size)
-        self.attencioner = Attencioner(shared_embedding)
-        self.main = MainModel(ctm_synchrony=ctm_synchrony)
-        self.devectorizer = DeVectorizer(shared_embedding)
+        shared_embedding = FactorizedTokenEmbedding(
+            self.vocab_size, rank=arch["embedding_rank"], embedding_dim=arch["embedding_dim"])
+        self.attencioner = Attencioner(
+            shared_embedding, width=arch["width"], hidden_width=arch["attencioner_width"],
+            depth=arch["attencioner_depth"],
+            embedding_dim=arch["embedding_dim"], mhc_streams=arch["mhc_streams"])
+        self.main = MainModel(
+            width=arch["width"], depth=arch["depth"],
+            kernel_size=arch["main_kernel_size"], mhc_streams=arch["mhc_streams"])
+        self.devectorizer = DeVectorizer(
+            shared_embedding, width=arch["width"], hidden_width=arch["devectorizer_width"],
+            depth=arch["devectorizer_depth"], embedding_dim=arch["embedding_dim"],
+            mhc_streams=arch["mhc_streams"])
 
     def map_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.token_to_compact[token_ids]
@@ -382,7 +296,8 @@ class VSLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, prompt: str, tokenizer: Any, max_new_tokens: int = 200,
-                 temperature: float = 0.8, top_k: int = 40, device: str = "cpu") -> str:
+                 temperature: float = 0.8, top_k: int = 40, device: str = "cpu",
+                 only_new_text: bool = False) -> str:
         if temperature <= 0:
             raise ValueError("temperature precisa ser maior que zero")
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False) or [tokenizer.eos_token_id]
@@ -400,6 +315,11 @@ class VSLM(nn.Module):
             generated.append(int(next_id.item()))
             next_vector = self.attencioner(next_id).squeeze(1)
             state, caches = self.main.step(next_vector, caches)
+        if only_new_text:
+            new_original_ids = self.compact_to_original[
+                torch.tensor(generated, dtype=torch.long, device=device)
+            ].tolist()
+            return tokenizer.decode(new_original_ids, skip_special_tokens=True)
         compact_ids = torch.cat((ids.squeeze(0), torch.tensor(generated, dtype=torch.long, device=device)))
         original_ids = self.compact_to_original[compact_ids].tolist()
         return tokenizer.decode(original_ids, skip_special_tokens=True)
@@ -424,20 +344,10 @@ class VSLM(nn.Module):
              loss: float | None = None, best_loss: float | None = None) -> None:
         path = Path(path)
         temp_path = path.with_name(path.name + ".tmp")
-        torch.save({"arch_version": 13, "state_dict": self.state_dict(), "vocab_size": self.vocab_size,
+        torch.save({"arch_version": 14, "state_dict": self.state_dict(), "vocab_size": self.vocab_size,
                     "original_vocab_size": self.original_vocab_size,
                     "compact_to_original": self.compact_to_original.cpu(),
-                    "width": WIDTH, "depth": DEPTH, "vector_bits": 4,
-                    "attencioner_width": ATTENCIONER_WIDTH,
-                    "attencioner_depth": ATTENCIONER_DEPTH,
-                    "devectorizer_width": DEVECTORIZER_WIDTH,
-                    "devectorizer_depth": DEVECTORIZER_DEPTH,
-                    "embedding_dim": EMBEDDING_DIM,
-                    "embedding_rank": EMBEDDING_RANK,
-                    "main_kernel_size": MAIN_KERNEL_SIZE,
-                    "ctm_ticks": CTM_TICKS, "ctm_synchrony": self.ctm_synchrony,
-                    "ctm_sync_pairs": CTM_SYNC_PAIRS,
-                    "trm_refinement_steps": TRM_REFINEMENT_STEPS,
+                    **self.architecture, "vector_bits": 4,
                     "tokenizer": tokenizer_name,
                     "step": step, "loss": loss, "best_loss": best_loss,
                     "optimizer_state": optimizer_state,
@@ -448,30 +358,48 @@ class VSLM(nn.Module):
     def load(cls, path: str | Path, device: str = "cpu") -> tuple["VSLM", dict[str, Any], str, dict[str, Any] | None, int, float]:
         ckpt = torch.load(path, map_location=device, weights_only=False)
         arch_version = ckpt.get("arch_version")
-        if arch_version != 13:
-            raise ValueError("Checkpoint incompatível: esta arquitetura usa o vocabulário completo, embedding fatorado 256/48 e projeções com largura 231. Inicie um treino novo, sem --resume.")
-        expected_architecture = {
-            "width": WIDTH,
-            "depth": DEPTH,
-            "attencioner_width": ATTENCIONER_WIDTH,
-            "attencioner_depth": ATTENCIONER_DEPTH,
-            "devectorizer_width": DEVECTORIZER_WIDTH,
-            "devectorizer_depth": DEVECTORIZER_DEPTH,
-            "embedding_dim": EMBEDDING_DIM,
-            "embedding_rank": EMBEDDING_RANK,
-        }
-        expected_architecture["main_kernel_size"] = MAIN_KERNEL_SIZE
+        if arch_version not in (13, 14):
+            raise ValueError(f"Versão de checkpoint {arch_version!r} incompatível; esperava arch_version 13 ou 14.")
         if ckpt.get("vocab_size") != len(ckpt.get("compact_to_original", [])):
             raise ValueError("Checkpoint inválido: tamanho do vocabulário não corresponde ao mapa de tokens.")
-        if any(ckpt.get(key) != value for key, value in expected_architecture.items()):
-            raise ValueError("Checkpoint incompatível: width/depth mudaram. Inicie um treino novo.")
+        saved_state = ckpt["state_dict"]
+        architecture = {
+            key: int(ckpt[key]) for key in (
+                "width", "depth", "attencioner_width", "attencioner_depth",
+                "devectorizer_width", "devectorizer_depth", "embedding_dim",
+                "embedding_rank", "main_kernel_size",
+            ) if key in ckpt
+        }
+        # mHC stream count is retained; infer it for checkpoints that predate
+        # explicitly storing it as architecture metadata.
+        architecture.setdefault("mhc_streams", int(saved_state["main.residuals.0.residual_logits"].shape[0]))
+        required = {"width", "depth", "attencioner_width", "attencioner_depth",
+                    "devectorizer_width", "devectorizer_depth", "embedding_dim",
+                    "embedding_rank", "main_kernel_size", "mhc_streams"}
+        if required - architecture.keys():
+            raise ValueError("Checkpoint incompleto: faltam parâmetros para reconstruir a arquitetura.")
         model = cls(ckpt["compact_to_original"], ckpt["original_vocab_size"],
-                    ctm_synchrony=ckpt.get("ctm_synchrony", CTM_USE_SYNCHRONY)).to(device)
+                    architecture=architecture).to(device)
+        optimizer_state = ckpt.get("optimizer_state")
         try:
-            model.load_state_dict(ckpt["state_dict"])
+            if arch_version == 13:
+                # Migrate V13 weights: remove the dense MoE/CTM/TRM tensors and
+                # retain the input + causal-context columns of each layer projection.
+                migrated_state = {}
+                removed_prefixes = ("main.router.", "main.ctm.", "main.trm.")
+                for name, tensor in saved_state.items():
+                    if name.startswith(removed_prefixes):
+                        continue
+                    if name.startswith("main.layer_projections.") and name.endswith(".weight"):
+                        tensor = tensor[:, :2 * architecture["width"]].contiguous()
+                    migrated_state[name] = tensor
+                model.load_state_dict(migrated_state)
+                # Optimizer slots refer to removed parameters and old projection shapes.
+                optimizer_state = None
+            else:
+                model.load_state_dict(saved_state)
         except RuntimeError as exc:
             raise ValueError("Checkpoint incompatível com a arquitetura atual.") from exc
-        optimizer_state = ckpt.get("optimizer_state")
         saved_best = ckpt.get("best_loss")
         best_loss = math.inf if saved_best is None else float(saved_best)
         return (model, ckpt.get("config", {}), ckpt["tokenizer"],
