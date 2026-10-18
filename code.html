@@ -78,7 +78,7 @@
 
   /* ── stats ── */
   .stats{
-    display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+    display:grid;grid-template-columns:repeat(3,1fr);gap:1px;
     background:var(--line);margin:38px 0 0;border:1px solid var(--line);
   }
   .stat{
@@ -158,6 +158,25 @@
   @media(max-width:560px){
     .stats{grid-template-columns:1fr;}
   }
+  .charts{display:grid;grid-template-columns:1fr;gap:20px;margin-top:30px}
+  .chart-panel{border:1px solid var(--line);background:var(--surface);padding:22px}
+  .chart-panel h2{font:700 14px Syne,sans-serif;letter-spacing:.18em;text-transform:uppercase;margin-bottom:12px}
+  .config-panel{margin-top:30px;border:1px solid var(--line);background:var(--surface);padding:24px}
+  .config-panel h2{font:700 16px Syne,sans-serif;letter-spacing:.16em;text-transform:uppercase;margin-bottom:18px}
+  .controls,.form-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}
+  .form-grid label,.schedule-row label{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+  input,select,button{font:12px 'DM Mono',monospace;color:var(--text);background:#0b0d0a;border:1px solid var(--line);padding:10px}
+  input:focus,select:focus{outline:1px solid var(--accent)}
+  button{cursor:pointer;color:var(--accent);text-transform:uppercase;letter-spacing:.1em}
+  button:hover{border-color:var(--accent)}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  .schedule{display:grid;gap:10px;margin:14px 0}
+  .schedule-row{display:grid;grid-template-columns:1.5fr .8fr 1.2fr 1fr .7fr auto;gap:10px;align-items:end;border-bottom:1px solid var(--line);padding-bottom:10px}
+  .schedule-actions{display:flex;gap:6px}
+  .form-actions{display:flex;gap:10px;flex-wrap:wrap}
+  .hint{color:var(--muted);font-size:11px;line-height:1.7;margin:8px 0 16px}
+  @media(max-width:850px){.controls,.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.schedule-row{grid-template-columns:1fr 1fr}}
+  @media(max-width:560px){.controls,.form-grid{grid-template-columns:1fr}.schedule-row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -173,6 +192,7 @@
       Comando <strong id="run-command">aguardando train.py</strong><br>
       Época <strong id="epoch-info">—</strong> · Passos por época <strong id="epoch-steps">23.439</strong><br>
       Status <strong id="run-status">Histórico salvo no painel</strong>
+      <br>Dataset <strong id="active-dataset">—</strong>
     </div>
   </header>
 
@@ -202,22 +222,64 @@
       <div class="v"><span id="improvement-count">14</span><small>registros</small></div>
       <div class="tag up" id="improvement-mean">média −0,28 / marco</div>
     </div>
+    <div class="stat">
+      <div class="k">PPL de treino atual</div>
+      <div class="v"><span id="current-ppl">—</span></div>
+      <div class="tag" id="current-ppl-step">perplexidade do passo atual</div>
+    </div>
+    <div class="stat">
+      <div class="k">PPL de validação atual</div>
+      <div class="v"><span id="current-valid-ppl">—</span></div>
+      <div class="tag" id="current-valid-ppl-step">atualizada junto com a validação</div>
+    </div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>Loss × Passo</h2>
-      <div class="legend">
-        <div class="lg"><span class="sw val"></span>Validação</div>
-        <div class="lg"><span class="sw tr"></span>Treino</div>
-        <div class="lg"><span class="sw ma"></span>Média móvel (5)</div>
-        <div class="lg"><span class="sw best"></span>Melhor validação</div>
+  <section class="charts">
+    <div class="chart-panel"><h2>Loss de treino × passo</h2><svg id="chart-train" viewBox="0 0 1240 360"></svg></div>
+    <div class="chart-panel"><h2>Loss de validação × passo</h2><svg id="chart-valid" viewBox="0 0 1240 360"></svg></div>
+    <div class="chart-panel"><h2>PPL × passo <small>(treino e validação)</small></h2><div class="legend"><div class="lg"><span class="sw tr"></span>Treino</div><div class="lg"><span class="sw val"></span>Validação</div></div><svg id="chart-ppl" viewBox="0 0 1240 360"></svg></div>
+  </section>
+
+  <section class="config-panel">
+    <h2>Controles e configuração do treino</h2>
+    <div class="controls">
+      <button id="pause-btn" type="button">Pausar</button>
+      <button id="resume-btn" type="button">Continuar</button>
+      <button id="stop-btn" type="button">Parar e salvar</button>
+    </div>
+    <form id="run-form">
+      <div class="form-grid">
+        <label>Checkpoint de saída<input id="cfg-out" required></label>
+        <label>Checkpoint de melhor validação<input id="cfg-best-out" placeholder="padrão: saída.best.pt"></label>
+        <label>Retomar checkpoint (opcional)<input id="cfg-resume" placeholder="deixe vazio para treino novo"></label>
+        <label>Arquivo de histórico (opcional)<input id="cfg-loss-log" placeholder="padrão: automático"></label>
+        <label>Tokenizer<input id="cfg-tokenizer" required></label>
+        <label>Coluna de texto<input id="cfg-text-column" required></label>
+        <label>Batch size<input id="cfg-batch-size" type="number" min="1" required></label>
+        <label>Block size<input id="cfg-block-size" type="number" min="1" required></label>
+        <label>Tokens por época<input id="cfg-tokens-per-epoch" type="number" min="1" required></label>
+        <label>Dispositivo<input id="cfg-device" placeholder="cuda ou cpu" required></label>
+        <label>Salvar a cada passos<input id="cfg-save-every" type="number" min="1" required></label>
+        <label>Validar a cada passos<input id="cfg-validation-every" type="number" min="1" required></label>
+        <label>Documentos de validação<input id="cfg-validation-documents" type="number" min="1" required></label>
+        <label>Lotes de validação<input id="cfg-validation-batches" type="number" min="1" required></label>
+        <label>Log a cada passos<input id="cfg-log-every" type="number" min="1" required></label>
+        <label>Shuffle buffer<input id="cfg-shuffle-buffer" type="number" min="1" required></label>
+        <label>Seed<input id="cfg-seed" type="number" required></label>
+        <label>Learning rate AdamW<input id="cfg-lr" type="number" step="any" required></label>
+        <label>Learning rate Muon<input id="cfg-muon-lr" type="number" step="any" required></label>
+        <label>Weight decay<input id="cfg-weight-decay" type="number" step="any" required></label>
+        <label><span>Compilar modelo</span><input id="cfg-compile" type="checkbox"></label>
+        <label><span>Sincronização CTM</span><input id="cfg-ctm-sync" type="checkbox" checked></label>
       </div>
-    </div>
-    <div class="chart-wrap">
-      <svg id="chart" viewBox="0 0 1240 560" preserveAspectRatio="xMidYMid meet"></svg>
-      <div id="tip"></div>
-    </div>
+      <h3>Agenda ordenada de datasets</h3>
+      <p class="hint">Cada linha é executada na ordem exibida. Configure o dataset, a configuração HF, o split (subdataset/partição), e quantas épocas ou passos rodar.</p>
+      <div id="schedule" class="schedule"></div>
+      <div class="form-actions">
+        <button type="button" id="add-dataset">Adicionar dataset</button>
+        <button type="submit" id="new-run-btn">Salvar atual e iniciar esta configuração</button>
+      </div>
+    </form>
   </section>
 
   <footer>
@@ -232,57 +294,32 @@ const legacyTrain = [[1,10.0179],[50,9.6171],[100,9.5323],[150,9.5707],[200,9.30
 
 const legacyValid = [[1,9.9129],[500,8.5601],[1000,7.9843],[1500,7.5243],[2000,7.0829],[2500,6.9033],[3000,6.6317],[3500,6.5163],[4000,6.4393],[4500,6.3318],[5000,6.2341],[5500,6.1679],[6000,6.1354],[6500,6.0850],[7000,6.0659]];
 
-let train=legacyTrain.slice(), valid=legacyValid.slice(), offset=0, connected=false;
-let polling=false,historyRevision=null,lastGraphStep=-1;
+let train=legacyTrain.slice(),valid=legacyValid.slice(),trainPpl=legacyTrain.map(p=>[p[0],Math.exp(p[1])]),validPpl=legacyValid.map(p=>[p[0],Math.exp(p[1])]);
+let offset=0,connected=false,polling=false,historyRevision=null,lastGraphStep=-1,formInitialized=false;
 let state={status:"Histórico anterior ao painel ao vivo",command:"painel demonstrativo preservado",current_step:7050,run_step:7050,final_step:23439,current_epoch:1,steps_per_epoch:23439,best_loss:6.0659,best_step:7000,min_train_loss:5.1812,validation_improvements:14,mean_improvement:(9.9129-6.0659)/14,first_validation:[1,9.9129],latest:{step:7050,run_step:7050,train_loss:6.9377}};
-const el=id=>document.getElementById(id), stepFmt=n=>Number(n||0).toLocaleString("pt-BR");
-const lossFmt=n=>Number.isFinite(Number(n))?Number(n).toFixed(4):"—";
-function nearest(a,x){if(!a.length)return null;let l=0,h=a.length;while(l<h){let m=(l+h)>>1;if(a[m][0]<x)l=m+1;else h=m;}if(!l)return a[0];if(l===a.length)return a[l-1];return Math.abs(a[l][0]-x)<Math.abs(a[l-1][0]-x)?a[l]:a[l-1];}
-function thin(a,max){if(a.length<=max)return a;let size=Math.ceil(a.length/(max/2)),out=[];for(let i=0;i<a.length;i+=size){let b=a.slice(i,i+size),lo=b[0],hi=b[0];for(const p of b){if(p[1]<lo[1])lo=p;if(p[1]>hi[1])hi=p;}out.push(...(lo[0]<=hi[0]?[lo,hi]:[hi,lo]));}return out;}
+const el=id=>document.getElementById(id),stepFmt=n=>Number(n||0).toLocaleString("pt-BR"),lossFmt=n=>Number.isFinite(Number(n))?Number(n).toFixed(4):"—";
+function thin(a,max=4000){if(a.length<=max)return a;let size=Math.ceil(a.length/(max/2)),out=[];for(let i=0;i<a.length;i+=size){let b=a.slice(i,i+size),lo=b[0],hi=b[0];for(const p of b){if(p[1]<lo[1])lo=p;if(p[1]>hi[1])hi=p;}out.push(...(lo[0]<=hi[0]?[lo,hi]:[hi,lo]));}return out;}
 function updateStats(s){
- const recorded=s.latest||{},step=Number(s.current_step??recorded.step??0),latest=Number(recorded.step)===step?recorded:{step,train_loss:s.current_train_loss},ep=Number(s.steps_per_epoch||23439),runStep=Number(s.run_step??recorded.run_step??Math.max(0,step-Number(s.start_step||0))),within=runStep?((runStep-1)%ep)+1:0;
- const best=s.best_loss??s.best_validation_loss,first=s.first_validation,firstVal=Array.isArray(first)?first[1]:null;
- el("run-command").textContent=s.command||"train.py";el("run-command").title=s.command||"";
- el("run-status").textContent=s.status||"Treinando";el("epoch-info").textContent="Época "+stepFmt(s.current_epoch||Math.floor(Math.max(step-1,0)/ep)+1);
- el("epoch-steps").textContent=stepFmt(ep);el("progress-label").textContent=stepFmt(within)+" / "+stepFmt(ep);
- el("progress-percent").textContent=(100*within/ep).toFixed(1).replace(".",",")+"%";el("progress-bar").style.transform="scaleX("+Math.min(1,within/ep)+")";
- el("best-val").textContent=lossFmt(best);el("best-step").textContent=s.best_step==null?"":("passo "+stepFmt(s.best_step));
- el("best-tag").textContent=best==null?"aguardando validação":("melhor validação registrada"+(s.best_out?" · "+s.best_out:""));
- el("initial-val").textContent=lossFmt(firstVal);el("initial-step").textContent=Array.isArray(first)?("passo "+stepFmt(first[0])):"";
- el("initial-tag").textContent=firstVal!=null&&best!=null?"−"+Math.abs((firstVal-best)/firstVal*100).toFixed(1).replace(".",",")+"% desde a validação inicial":"validação inicial";
- el("current-train").textContent=lossFmt(latest.train_loss);el("current-step").textContent=latest.step==null?"":("passo "+stepFmt(latest.step));
- el("min-train").textContent=s.min_train_loss==null?"mínimo observado —":"mínimo observado "+lossFmt(s.min_train_loss);
- el("improvement-count").textContent=stepFmt(s.validation_improvements||0);
- el("improvement-mean").textContent=s.mean_improvement==null?"média — / marco":"média −"+Number(s.mean_improvement).toFixed(2)+" / marco";
- el("footer-status").textContent=s.status||"Treino ativo";el("history-path").textContent=s.loss_log||"histórico completo salvo";
+ const recorded=s.latest||{},step=Number(s.current_step??recorded.step??0),latest=Number(recorded.step)===step?recorded:{step,train_loss:s.current_train_loss},ep=Number(s.steps_per_epoch||23439),runStep=Number(s.run_step??recorded.run_step??Math.max(0,step-Number(s.start_step||0))),within=runStep?((runStep-1)%ep)+1:0,best=s.best_loss??s.best_validation_loss,first=s.first_validation,firstVal=Array.isArray(first)?first[1]:null;
+ el("run-command").textContent=s.command||"train.py";el("run-command").title=s.command||"";el("run-status").textContent=s.status||"Treinando";el("active-dataset").textContent=s.active_dataset?(s.active_dataset+" / "+(s.active_subset||"")+" / "+(s.active_split||"train")):"—";
+ el("epoch-info").textContent="Época "+stepFmt(s.current_epoch||Math.floor(Math.max(step-1,0)/ep)+1);el("epoch-steps").textContent=stepFmt(ep);el("progress-label").textContent=stepFmt(within)+" / "+stepFmt(ep);el("progress-percent").textContent=(100*within/ep).toFixed(1).replace(".",",")+"%";el("progress-bar").style.transform="scaleX("+Math.min(1,within/ep)+")";
+ el("best-val").textContent=lossFmt(best);el("best-step").textContent=s.best_step==null?"":("passo "+stepFmt(s.best_step));el("best-tag").textContent=best==null?"aguardando validação":("melhor validação registrada"+(s.best_out?" · "+s.best_out:""));el("initial-val").textContent=lossFmt(firstVal);el("initial-step").textContent=Array.isArray(first)?("passo "+stepFmt(first[0])):"";el("initial-tag").textContent=firstVal!=null&&best!=null?"−"+Math.abs((firstVal-best)/firstVal*100).toFixed(1).replace(".",",")+"% desde a validação inicial":"validação inicial";
+ el("current-train").textContent=lossFmt(latest.train_loss);el("current-step").textContent=latest.step==null?"":("passo "+stepFmt(latest.step));el("min-train").textContent=s.min_train_loss==null?"mínimo observado —":"mínimo observado "+lossFmt(s.min_train_loss);
+ let tp=latest.train_ppl??(latest.train_loss!=null?Math.exp(Math.min(latest.train_loss,709)):null),lastValid=latest.validation_loss!=null?[latest.step,latest.validation_ppl??Math.exp(Math.min(latest.validation_loss,709))]:validPpl.at(-1),vp=lastValid?.[1];el("current-ppl").textContent=tp==null?"—":Number(tp).toFixed(2);el("current-ppl-step").textContent=latest.step==null?"perplexidade do passo atual":"passo "+stepFmt(latest.step);el("current-valid-ppl").textContent=vp==null?"—":Number(vp).toFixed(2);el("current-valid-ppl-step").textContent=lastValid?"validação no passo "+stepFmt(lastValid[0]):"aguardando validação";
+ el("improvement-count").textContent=stepFmt(s.validation_improvements||0);el("improvement-mean").textContent=s.mean_improvement==null?"média — / marco":"média −"+Number(s.mean_improvement).toFixed(2)+" / marco";el("footer-status").textContent=s.status||"Treino ativo";el("history-path").textContent=s.loss_log||"histórico completo salvo";
+ el("pause-btn").disabled=!s.controls_ready||s.status==="Pausado";el("resume-btn").disabled=!s.controls_ready||s.status!=="Pausado";el("stop-btn").disabled=!s.controls_ready;el("new-run-btn").disabled=!s.controls_ready;
 }
-function draw(s){
- const svg=el("chart"),W=1240,H=560,M={t:34,r:34,b:56,l:74},iw=W-M.l-M.r,ih=H-M.t-M.b;
- const ct=thin(train,4000),cv=thin(valid,2000),last=Math.max(train.length?train[train.length-1][0]:0,valid.length?valid[valid.length-1][0]:0);
- const xmax=Math.max(1,Number(s.steps_per_epoch||0),Number(s.current_step||0),last);
- let ymin=Infinity,ymax=-Infinity;for(const p of ct.concat(cv)){ymin=Math.min(ymin,p[1]);ymax=Math.max(ymax,p[1]);}
- if(!Number.isFinite(ymin)){ymin=0;ymax=10;}const pad=Math.max(.25,(ymax-ymin)*.08);ymin=Math.max(0,Math.floor(ymin-pad));ymax=Math.ceil(ymax+pad)||1;
- const X=x=>M.l+x/xmax*iw,Y=y=>M.t+(ymax-y)/(ymax-ymin||1)*ih,path=a=>a.map((p,i)=>(i?"L":"M")+X(p[0]).toFixed(1)+" "+Y(p[1]).toFixed(1)).join(" ");
- const avg=ct.map((p,i)=>{let q=ct.slice(Math.max(0,i-4),i+1);return[p[0],q.reduce((n,x)=>n+x[1],0)/q.length];});
- let o='<defs><linearGradient id="vf" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#d3f24a" stop-opacity=".24"/><stop offset="100%" stop-color="#d3f24a" stop-opacity="0"/></linearGradient><filter id="glow"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
- for(let i=0;i<=5;i++){let v=ymin+(ymax-ymin)*i/5,y=Y(v);o+='<line x1="'+M.l+'" y1="'+y+'" x2="'+(W-M.r)+'" y2="'+y+'" stroke="#1c2216"/><text x="'+(M.l-14)+'" y="'+(y+4)+'" text-anchor="end" fill="#79836a" font-family="DM Mono" font-size="12">'+v.toFixed(1)+'</text>';}
- for(let i=0;i<=6;i++){let n=Math.round(xmax*i/6),x=X(n);o+='<line x1="'+x+'" y1="'+M.t+'" x2="'+x+'" y2="'+(H-M.b)+'" stroke="#161c12"/><text x="'+x+'" y="'+(H-M.b+28)+'" text-anchor="middle" fill="#79836a" font-family="DM Mono" font-size="12">'+n.toLocaleString("pt-BR")+'</text>';}
- const best=s.best_loss??s.best_validation_loss,bs=s.best_step??s.best_validation_step;
- if(best!=null){let y=Y(best);o+='<line x1="'+M.l+'" y1="'+y+'" x2="'+(W-M.r)+'" y2="'+y+'" stroke="#9ab52f" stroke-dasharray="5 7" opacity=".65"/><text x="'+(M.l+10)+'" y="'+(y-10)+'" fill="#9ab52f" font-family="DM Mono" font-size="11">MELHOR VALIDAÇÃO '+lossFmt(best)+'</text>';}
- let tp=path(ct),vp=path(cv);if(cv.length)o+='<path d="'+vp+' L '+X(cv[cv.length-1][0])+' '+(H-M.b)+' L '+X(cv[0][0])+' '+(H-M.b)+' Z" fill="url(#vf)"/>';
- if(ct.length)o+='<path d="'+tp+'" fill="none" stroke="#e07a5f" stroke-width="1.6" stroke-opacity=".65"/>';
- if(avg.length)o+='<path d="'+path(avg)+'" fill="none" stroke="#f2ead8" stroke-width="2.2" stroke-opacity=".8"/>';
- if(cv.length)o+='<path d="'+vp+'" fill="none" stroke="#d3f24a" stroke-width="3.2" filter="url(#glow)"/>';
- cv.forEach(p=>{if(p[0]===bs||p===cv[cv.length-1])o+='<circle cx="'+X(p[0])+'" cy="'+Y(p[1])+'" r="5" fill="#0b0d0a" stroke="#d3f24a" stroke-width="2"/>';});
- o+='<line id="cross" x1="0" y1="'+M.t+'" x2="0" y2="'+(H-M.b)+'" stroke="#d3f24a" opacity="0"/><rect id="hit" x="'+M.l+'" y="'+M.t+'" width="'+iw+'" height="'+ih+'" fill="transparent" style="cursor:crosshair"/>';
- svg.setAttribute("viewBox","0 0 "+W+" "+H);svg.innerHTML=o;
- const hit=svg.querySelector("#hit"),cross=svg.querySelector("#cross"),tip=el("tip");
- hit.addEventListener("mousemove",e=>{let r=svg.getBoundingClientRect(),sx=(e.clientX-r.left)/r.width*W,n=Math.max(0,Math.round((sx-M.l)/iw*xmax)),t=nearest(train,n),v=nearest(valid,n);if(!t&&!v)return;let sv=v&&Math.abs(v[0]-n)<=Math.max(100,xmax/50),f=sv?v[0]:t[0];cross.setAttribute("x1",X(f));cross.setAttribute("x2",X(f));cross.setAttribute("opacity",".4");tip.innerHTML="<b>Passo "+stepFmt(f)+"</b>"+(t?'<div class="r"><span>Treino</span><span class="tv">'+lossFmt(t[1])+"</span></div>":"")+(sv?'<div class="r"><span>Validação</span><span class="vv">'+lossFmt(v[1])+"</span></div>":"");let k=W/r.width;tip.style.left=X(f)/k+"px";tip.style.top=Y(sv?v[1]:t[1])/k+"px";tip.style.opacity=1;});
- hit.addEventListener("mouseleave",()=>{tip.style.opacity=0;cross.setAttribute("opacity","0");});
-}
+function drawOne(id,series,xmax){const svg=el(id),W=1240,H=360,M={t:20,r:28,b:42,l:72},iw=W-M.l-M.r,ih=H-M.t-M.b,data=series.map(s=>({...s,points:thin(s.points.filter(p=>Number.isFinite(p[1])))})),all=data.flatMap(s=>s.points);let ymin=all.length?Math.min(...all.map(p=>p[1])):0,ymax=all.length?Math.max(...all.map(p=>p[1])):1;if(ymin===ymax){ymin=Math.max(0,ymin*.9);ymax+=1;}let pad=(ymax-ymin)*.08;ymin=Math.max(0,ymin-pad);ymax+=pad;const X=x=>M.l+x/xmax*iw,Y=y=>M.t+(ymax-y)/(ymax-ymin)*ih;let o="";for(let i=0;i<=4;i++){let v=ymin+(ymax-ymin)*i/4,y=Y(v);o+='<line x1="'+M.l+'" y1="'+y+'" x2="'+(W-M.r)+'" y2="'+y+'" stroke="#232a1c"/><text x="'+(M.l-10)+'" y="'+(y+4)+'" text-anchor="end" fill="#79836a" font-family="DM Mono" font-size="12">'+(ymax>1000?v.toFixed(0):v.toFixed(2))+'</text>';}for(let i=0;i<=5;i++){let n=Math.round(xmax*i/5),x=X(n);o+='<line x1="'+x+'" y1="'+M.t+'" x2="'+x+'" y2="'+(H-M.b)+'" stroke="#161c12"/><text x="'+x+'" y="'+(H-12)+'" text-anchor="middle" fill="#79836a" font-family="DM Mono" font-size="12">'+n.toLocaleString("pt-BR")+'</text>';}for(const s of data){if(!s.points.length)continue;let d=s.points.map((p,i)=>(i?"L":"M")+X(p[0]).toFixed(1)+" "+Y(p[1]).toFixed(1)).join(" ");o+='<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="2.2"/>';}svg.setAttribute("viewBox","0 0 "+W+" "+H);svg.innerHTML=o;}
+function draw(s){const xmax=Math.max(1,Number(s.current_step||0),train.at(-1)?.[0]||0,valid.at(-1)?.[0]||0);drawOne("chart-train",[{points:train,color:"#e07a5f"}],xmax);drawOne("chart-valid",[{points:valid,color:"#d3f24a"}],xmax);drawOne("chart-ppl",[{points:trainPpl,color:"#e07a5f"},{points:validPpl,color:"#d3f24a"}],xmax);}
 function render(s){updateStats(s);const step=Number(s.current_step??0);if(lastGraphStep<0||step-lastGraphStep>=100||step===0){draw(s);lastGraphStep=step;}}
-async function readHistory(){while(true){let r=await fetch("/api/history?offset="+offset,{cache:"no-store"});if(!r.ok)throw Error("history");let d=await r.json();offset=d.offset;let lines=d.text.split("\n").filter(Boolean);for(const line of lines){let q=JSON.parse(line);if(q.train_loss!=null)train.push([+q.step,+q.train_loss]);if(q.validation_loss!=null)valid.push([+q.step,+q.validation_loss]);}if(!d.text||!lines.length)break;}}
-async function poll(){if(polling)return;polling=true;try{let r=await fetch("/api/state",{cache:"no-store"});if(!r.ok)throw Error("state");let s=await r.json();if(!connected||historyRevision!==s.history_revision){train=[];valid=[];offset=0;lastGraphStep=-1;connected=true;historyRevision=s.history_revision;}await readHistory();state=s;render(state);}catch(e){if(!connected)render(state);el("run-status").textContent=connected?(state.status||"treino ativo"):"Sem conexão com train.py";}finally{polling=false;}}
+function addScheduleRow(item={dataset:"HuggingFaceTB/cosmopedia",subset:"stories",split:"train",mode:"epochs",count:1}){const row=document.createElement("div");row.className="schedule-row";const fields=[ ["Dataset", "dataset",item.dataset||""], ["Config HF", "subset",item.subset||""], ["Split / subdataset", "split",item.split||"train"], ["Treinar por", "mode",item.mode||"epochs"], ["Quantidade", "count",item.count||1] ];for(const [label,key,value] of fields){const wrap=document.createElement("label");wrap.textContent=label;let input;if(key==="mode"){input=document.createElement("select");for(const [v,t] of [["epochs","Épocas"],["steps","Passos"]]){const op=document.createElement("option");op.value=v;op.textContent=t;input.append(op);}}else{input=document.createElement("input");if(key==="count"){input.type="number";input.min="1";}}input.dataset.key=key;input.value=value;wrap.append(input);row.append(wrap);}const actions=document.createElement("div");actions.className="schedule-actions";for(const [text,fn] of [["↑",()=>row.previousElementSibling&&row.parentNode.insertBefore(row,row.previousElementSibling)],["↓",()=>row.nextElementSibling&&row.parentNode.insertBefore(row.nextElementSibling,row)],["×",()=>row.remove()]]){const b=document.createElement("button");b.type="button";b.textContent=text;b.onclick=fn;actions.append(b);}row.append(actions);el("schedule").append(row);}
+function initForm(s){if(formInitialized)return;formInitialized=true;const c=s.run_config||{};for(const [key,id,def] of [["out","cfg-out","vslm-256m.pt"],["best_out","cfg-best-out",""],["resume","cfg-resume",""],["loss_log","cfg-loss-log",""],["tokenizer","cfg-tokenizer","gpt2"],["text_column","cfg-text-column","text"],["batch_size","cfg-batch-size",1],["block_size","cfg-block-size",128],["tokens_per_epoch","cfg-tokens-per-epoch",1000000],["device","cfg-device","cpu"],["save_every","cfg-save-every",100],["validation_every","cfg-validation-every",500],["validation_documents","cfg-validation-documents",128],["validation_batches","cfg-validation-batches",16],["log_every","cfg-log-every",50],["shuffle_buffer","cfg-shuffle-buffer",100],["seed","cfg-seed",42],["lr","cfg-lr",1e-4],["muon_lr","cfg-muon-lr",1e-3],["weight_decay","cfg-weight-decay",.01]])el(id).value=c[key]??def;el("cfg-compile").checked=!!c.compile;el("cfg-ctm-sync").checked=!c.no_ctm_synchrony;const plan=s.dataset_plan?.length?s.dataset_plan:[{dataset:"HuggingFaceTB/cosmopedia",subset:"stories",split:"train",mode:"epochs",count:1}];el("schedule").innerHTML="";plan.forEach(addScheduleRow);}
+async function post(path,data){const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok)throw Error(await r.text());return r.json();}
+async function control(action){try{await post("/api/control",{action});}catch(e){el("run-status").textContent="Erro: "+e.message;}}
+el("pause-btn").onclick=()=>control("pause");el("resume-btn").onclick=()=>control("resume");el("stop-btn").onclick=()=>{if(confirm("Parar e salvar o checkpoint atual?"))control("stop");};el("add-dataset").onclick=()=>addScheduleRow();
+el("run-form").onsubmit=async e=>{e.preventDefault();if(!confirm("A execução atual será salva e parada antes de iniciar a configuração abaixo. Continuar?"))return;const config={};for(const [key,id] of [["out","cfg-out"],["best_out","cfg-best-out"],["resume","cfg-resume"],["loss_log","cfg-loss-log"],["tokenizer","cfg-tokenizer"],["text_column","cfg-text-column"],["device","cfg-device"],["batch_size","cfg-batch-size"],["block_size","cfg-block-size"],["tokens_per_epoch","cfg-tokens-per-epoch"],["save_every","cfg-save-every"],["validation_every","cfg-validation-every"],["validation_documents","cfg-validation-documents"],["validation_batches","cfg-validation-batches"],["log_every","cfg-log-every"],["shuffle_buffer","cfg-shuffle-buffer"],["seed","cfg-seed"],["lr","cfg-lr"],["muon_lr","cfg-muon-lr"],["weight_decay","cfg-weight-decay"]])config[key]=el(id).type==="number"?Number(el(id).value):el(id).value;config.compile=el("cfg-compile").checked;config.no_ctm_synchrony=!el("cfg-ctm-sync").checked;const schedule=[...document.querySelectorAll(".schedule-row")].map(row=>{const v={};row.querySelectorAll("[data-key]").forEach(i=>v[i.dataset.key]=i.type==="number"?Number(i.value):i.value);return v;});try{await post("/api/new-run",{config,schedule});el("run-status").textContent="Parando/salvando; o novo painel abrirá quando iniciar.";}catch(err){el("run-status").textContent="Erro: "+err.message;}};
+async function readHistory(){while(true){let r=await fetch("/api/history?offset="+offset,{cache:"no-store"});if(!r.ok)throw Error("history");let d=await r.json();offset=d.offset;let lines=d.text.split("\n").filter(Boolean);for(const line of lines){let q=JSON.parse(line);if(q.train_loss!=null){train.push([+q.step,+q.train_loss]);trainPpl.push([+q.step,+(q.train_ppl??Math.exp(Math.min(+q.train_loss,709)))]);}if(q.validation_loss!=null){valid.push([+q.step,+q.validation_loss]);validPpl.push([+q.step,+(q.validation_ppl??Math.exp(Math.min(+q.validation_loss,709)))]);}}if(!d.text||!lines.length)break;}}
+async function poll(){if(polling)return;polling=true;try{let r=await fetch("/api/state",{cache:"no-store"});if(!r.ok)throw Error("state");let s=await r.json();if(!connected||historyRevision!==s.history_revision){train=[];valid=[];trainPpl=[];validPpl=[];offset=0;lastGraphStep=-1;connected=true;historyRevision=s.history_revision;}await readHistory();state=s;initForm(s);render(state);}catch(e){if(!connected){if(!formInitialized)initForm(state);render(state);}el("run-status").textContent=connected?(state.status||"treino ativo"):"Sem conexão com train.py";}finally{polling=false;}}
 render(state);poll();setInterval(poll,2000);
 </script>
 </body>
